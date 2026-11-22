@@ -1,7 +1,8 @@
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ApiKeyAuth } from "@earendil-works/pi-ai/compat";
+import type { ApiKeyAuth, ProviderHeaders } from "@earendil-works/pi-ai/compat";
 
 /** Env var Vibe itself reads, kept identical to le-vibe's `PROVIDER_ENV_KEYS["vibe"]`. */
 export const VIBE_ENV_KEY = "MISTRAL_API_KEY";
@@ -11,12 +12,38 @@ interface VibeStoredCredential {
   type?: string;
   key?: string;
   access_token?: string;
+  id_token?: string;
   expires_at?: number;
+  organization_id?: string;
+  workspace_id?: string;
 }
 
 export interface VibeCredential {
   token: string;
   source: string;
+  /** Tenant headers required when the token is a Mistral OIDC id token. */
+  headers?: ProviderHeaders;
+}
+
+export function pkcePair(): { verifier: string; challenge: string } {
+  const toBase64Url = (buffer: Buffer): string =>
+    buffer.toString("base64").replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+  const verifier = toBase64Url(randomBytes(32));
+  const challenge = toBase64Url(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+/** le-vibe sends `x-external-organization-id` / `x-external-workspace-id` alongside the id token. */
+export function oidcTenantHeaders(credential: {
+  organizationId?: unknown;
+  workspaceId?: unknown;
+}): { headers?: ProviderHeaders } {
+  const headers: ProviderHeaders = {};
+  const organizationId = typeof credential.organizationId === "string" ? credential.organizationId.trim() : "";
+  const workspaceId = typeof credential.workspaceId === "string" ? credential.workspaceId.trim() : "";
+  if (organizationId) headers["x-external-organization-id"] = organizationId;
+  if (workspaceId) headers["x-external-workspace-id"] = workspaceId;
+  return Object.keys(headers).length > 0 ? { headers } : {};
 }
 
 /** Same store le-vibe writes: `~/.le-vibe/auth.json` (override with `LE_VIBE_AUTH_FILE`). */
@@ -55,7 +82,11 @@ export async function resolveVibeCredential(
   const accessToken = stored?.access_token?.trim();
   const expiresAt = Number(stored?.expires_at ?? 0);
   if (accessToken && expiresAt * 1000 > Date.now()) {
-    return { token: accessToken, source: "~/.le-vibe OIDC token" };
+    return {
+      token: stored?.id_token?.trim() || accessToken,
+      source: "~/.le-vibe OIDC token",
+      ...oidcTenantHeaders({ organizationId: stored?.organization_id, workspaceId: stored?.workspace_id }),
+    };
   }
   return undefined;
 }
@@ -84,6 +115,9 @@ export const vibeApiKeyAuth: ApiKeyAuth = {
     }
     const resolved = await resolveVibeCredential((name) => ctx.env(name));
     if (!resolved) return undefined;
-    return { auth: { apiKey: resolved.token }, source: resolved.source };
+    return {
+      auth: { apiKey: resolved.token, ...(resolved.headers ? { headers: resolved.headers } : {}) },
+      source: resolved.source,
+    };
   },
 };

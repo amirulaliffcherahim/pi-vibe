@@ -86,6 +86,7 @@ export async function fetchVibeCatalog(
   signal: AbortSignal,
   baseUrl: string = VIBE_BASE_URL,
   providerId = "vibe",
+  extraHeaders?: Record<string, string>,
 ): Promise<VibeChatModel[]> {
   const root = baseUrl.replace(/\/+$/u, "");
   const response = await fetch(`${root}${CATALOG_PATH}`, {
@@ -93,6 +94,7 @@ export async function fetchVibeCatalog(
       Authorization: `Bearer ${apiKey}`,
       Accept: "application/json",
       "User-Agent": VIBE_USER_AGENT,
+      ...extraHeaders,
     },
     signal,
   });

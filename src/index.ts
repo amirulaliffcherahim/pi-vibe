@@ -3,6 +3,7 @@ import { createProvider, mistralConversationsApi } from "@earendil-works/pi-ai/c
 import type { RefreshModelsContext } from "@earendil-works/pi-ai/compat";
 import { resolveVibeCredential, vibeApiKeyAuth, vibeAuthFilePath } from "./auth.js";
 import { VIBE_BASE_URL, fetchVibeCatalog, type VibeChatModel } from "./catalog.js";
+import { vibeOAuth, vibeOAuthToAuth } from "./oauth.js";
 
 const PROVIDER_ID = "vibe";
 const PROVIDER_NAME = "Mistral Vibe";
@@ -16,7 +17,7 @@ async function warmCatalog(): Promise<VibeChatModel[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), STARTUP_FETCH_TIMEOUT_MS);
   try {
-    return await fetchVibeCatalog(credential.token, controller.signal, VIBE_BASE_URL, PROVIDER_ID);
+    return await fetchVibeCatalog(credential.token, controller.signal, VIBE_BASE_URL, PROVIDER_ID, credential.headers);
   } catch {
     // Empty baseline: /login vibe and the next refresh still recover the catalog.
     return [];
@@ -33,7 +34,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     id: PROVIDER_ID,
     name: PROVIDER_NAME,
     baseUrl: VIBE_BASE_URL,
-    auth: { apiKey: vibeApiKeyAuth },
+    auth: { apiKey: vibeApiKeyAuth, oauth: vibeOAuth },
     api: mistralConversationsApi(),
     models: baselineModels,
     fetchModels: async (context: RefreshModelsContext): Promise<VibeChatModel[]> => {
@@ -42,12 +43,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       );
       if (!context.allowNetwork || context.signal.aborted) return cached;
 
-      const credentialKey = context.credential?.type === "api_key" ? context.credential.key : undefined;
-      const token = credentialKey ?? (await resolveVibeCredential())?.token;
+      let token: string | undefined;
+      let headers: Record<string, string> | undefined;
+      const credential = context.credential;
+      if (credential?.type === "api_key") {
+        token = credential.key;
+      } else if (credential?.type === "oauth") {
+        const auth = vibeOAuthToAuth(credential);
+        token = auth.apiKey;
+        headers = auth.headers;
+      } else {
+        const resolved = await resolveVibeCredential();
+        token = resolved?.token;
+        headers = resolved?.headers;
+      }
       // No credential: keep the stored/startup catalog instead of wiping it.
       if (!token) return cached.length > 0 ? cached : baselineModels;
 
-      return fetchVibeCatalog(token, context.signal, context.baseUrl ?? VIBE_BASE_URL, PROVIDER_ID);
+      return fetchVibeCatalog(token, context.signal, context.baseUrl ?? VIBE_BASE_URL, PROVIDER_ID, headers);
     },
   });
 
@@ -62,8 +75,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       const credential = await resolveVibeCredential();
       const lines = [
         `provider=${PROVIDER_ID} name=${PROVIDER_NAME} registered=${registered ? "yes" : "no"}`,
-        `credential=${credential ? credential.source : "missing (use /login vibe or sign in with le-vibe)"}`,
+        `credential=${credential ? credential.source : "missing (use /login vibe → Sign in with your Mistral account)"}`,
+        `tenant-headers=${credential?.headers ? Object.keys(credential.headers).join(",") : "none"}`,
         `configured=${status?.configured ? "yes" : "no"}${status?.source ? ` (${status.source})` : ""}`,
+        `oauth-login=${vibeOAuth.loginLabel}`,
         `models=${models.length}${models.length > 0 ? `: ${models.slice(0, 6).map((model) => model.id).join(", ")}` : ""}`,
         `le-vibe-auth=${vibeAuthFilePath()}`,
       ];
