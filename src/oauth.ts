@@ -5,7 +5,7 @@ import { oidcTenantHeaders, pkcePair } from "./auth.js";
 
 /** Same OIDC application le-vibe signs in with (`python/le_vibe/providers/auth.py`). */
 export const VIBE_OIDC_ISSUER = "https://auth.mistral.ai";
-export const VIBE_OIDC_CLIENT_ID = "829da7e7-628f-4795-829a8cca609c76d4";
+export const VIBE_OIDC_CLIENT_ID = "829da7e7-628f-4795-829a-8cca609c76d4";
 export const VIBE_OIDC_AUDIENCE = "https://api.mistral.ai";
 export const VIBE_OIDC_SCOPE = "openid offline_access email profile";
 export const VIBE_OIDC_REDIRECT_URI = "http://127.0.0.1:8766/callback";
