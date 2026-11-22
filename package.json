@@ -1,0 +1,42 @@
+{
+  "name": "pi-vibe",
+  "version": "1.0.0",
+  "description": "Standalone Mistral Vibe provider for Pi Coding Agent — reuses ~/.le-vibe credentials, /login vibe, live Vibe model catalog (surface=vibe-code), and pi's native Mistral Conversations streaming",
+  "author": "amirulaliffcherahim",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amirulaliffcherahim/pi-vibe.git"
+  },
+  "homepage": "https://github.com/amirulaliffcherahim/pi-vibe#readme",
+  "bugs": {
+    "url": "https://github.com/amirulaliffcherahim/pi-vibe/issues"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "mistral",
+    "vibe",
+    "provider"
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "src",
+    "tsconfig.json"
+  ],
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  }
+}
