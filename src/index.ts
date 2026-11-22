@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createProvider, mistralConversationsApi } from "@earendil-works/pi-ai/compat";
 import type { RefreshModelsContext } from "@earendil-works/pi-ai/compat";
-import { resolveVibeCredential, vibeApiKeyAuth } from "./auth.js";
+import { resolveVibeCredential, vibeApiKeyAuth, vibeAuthFilePath } from "./auth.js";
 import { VIBE_BASE_URL, fetchVibeCatalog, type VibeChatModel } from "./catalog.js";
 
 const PROVIDER_ID = "vibe";
@@ -52,6 +52,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.registerProvider(provider);
+
+  pi.registerCommand("vibe", {
+    description: "Show Mistral Vibe provider status (registration, credential source, live catalog)",
+    handler: async (_args, ctx) => {
+      const registered = ctx.modelRegistry?.getProvider?.(PROVIDER_ID);
+      const status = ctx.modelRegistry?.getProviderAuthStatus?.(PROVIDER_ID);
+      const models = registered?.getModels?.() ?? [];
+      const credential = await resolveVibeCredential();
+      const lines = [
+        `provider=${PROVIDER_ID} name=${PROVIDER_NAME} registered=${registered ? "yes" : "no"}`,
+        `credential=${credential ? credential.source : "missing (use /login vibe or sign in with le-vibe)"}`,
+        `configured=${status?.configured ? "yes" : "no"}${status?.source ? ` (${status.source})` : ""}`,
+        `models=${models.length}${models.length > 0 ? `: ${models.slice(0, 6).map((model) => model.id).join(", ")}` : ""}`,
+        `le-vibe-auth=${vibeAuthFilePath()}`,
+      ];
+      const text = `pi-vibe\n${lines.join("\n")}`;
+      if (ctx.hasUI) ctx.ui.notify(text, "info");
+      else console.log(text);
+    },
+  });
 
   pi.on("session_start", (_event, ctx) => {
     if (process.env.PI_OFFLINE !== undefined) return;
