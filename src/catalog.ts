@@ -1,4 +1,4 @@
-import type { Model, ThinkingLevelMap } from "@earendil-works/pi-ai/compat";
+import type { Model, ProviderHeaders, ThinkingLevelMap } from "@earendil-works/pi-ai/compat";
 
 export const VIBE_BASE_URL = "https://api.mistral.ai";
 export const VIBE_USER_AGENT = "pi-vibe/1.0.0";
@@ -86,15 +86,20 @@ export async function fetchVibeCatalog(
   signal: AbortSignal,
   baseUrl: string = VIBE_BASE_URL,
   providerId = "vibe",
-  extraHeaders?: Record<string, string>,
+  extraHeaders?: ProviderHeaders,
 ): Promise<VibeChatModel[]> {
   const root = baseUrl.replace(/\/+$/u, "");
+  // ProviderHeaders allows null to delete a header; fetch needs plain strings.
+  const extra: Record<string, string> = {};
+  for (const [name, value] of Object.entries(extraHeaders ?? {})) {
+    if (typeof value === "string") extra[name] = value;
+  }
   const response = await fetch(`${root}${CATALOG_PATH}`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
       Accept: "application/json",
       "User-Agent": VIBE_USER_AGENT,
-      ...extraHeaders,
+      ...extra,
     },
     signal,
   });

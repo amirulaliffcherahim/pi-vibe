@@ -1,62 +1,64 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:http";
 import type { ModelAuth, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "@earendil-works/pi-ai/compat";
-import { oidcTenantHeaders, pkcePair } from "./auth.js";
 
-/** Same OIDC application le-vibe signs in with (`python/le_vibe/providers/auth.py`). */
-export const VIBE_OIDC_ISSUER = "https://auth.mistral.ai";
-export const VIBE_OIDC_CLIENT_ID = "829da7e7-628f-4795-829a-8cca609c76d4";
-export const VIBE_OIDC_AUDIENCE = "https://api.mistral.ai";
-export const VIBE_OIDC_SCOPE = "openid offline_access email profile";
-export const VIBE_OIDC_REDIRECT_URI = "http://127.0.0.1:8766/callback";
+/**
+ * Mistral Vibe account sign-in, ported from the Vibe CLI's browser sign-in gateway
+ * (`vibe/setup/auth/browser_sign_in.py`): start a process, open the console page,
+ * poll until the browser finishes, then exchange the signed PKCE verifier for a
+ * Vibe API key. No API key is ever typed or copied.
+ *
+ * The OIDC client (`auth.mistral.ai`, client `829da7e7-…`) is *not* used: Mistral
+ * answers `invalid_client` for it, so only this flow is implemented.
+ */
+export const VIBE_CONSOLE_ORIGIN = "https://console.mistral.ai";
+const SIGN_IN_API_BASE = `${VIBE_CONSOLE_ORIGIN}/api`;
+const POLL_INTERVAL_MS = 3_000;
+/** Console rate-limits polling (HTTP 429); back off instead of failing the attempt. */
+const MAX_CONSECUTIVE_POLL_FAILURES = 8;
+/** Sign-in returns a long-lived Vibe API key; the stored expiry is renewed on refresh. */
+const CREDENTIAL_TTL_MS = 365 * 24 * 60 * 60 * 1_000;
 
-const LOGIN_TIMEOUT_MS = 180_000;
-
-interface OidcEndpoints {
-  authorizationEndpoint: string;
-  tokenEndpoint: string;
+interface SignInProcess {
+  processId: string;
+  signInUrl: string;
+  pollUrl: string;
+  expiresAt: number;
 }
 
-interface TokenSet {
-  access: string;
-  refresh?: string;
-  idToken?: string;
-  expiresIn: number;
-}
-
-function base64Url(buffer: Buffer): string {
-  return buffer.toString("base64").replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+interface PollResult {
+  status: "pending" | "completed" | "expired" | "denied" | "error";
+  exchangeToken?: string;
+  message?: string;
 }
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-async function discoverEndpoints(signal: AbortSignal): Promise<OidcEndpoints> {
-  const response = await fetch(`${VIBE_OIDC_ISSUER}/.well-known/openid-configuration`, { signal });
-  if (!response.ok) {
-    throw new Error(`Mistral OIDC discovery failed: HTTP ${response.status}`);
+/** The server hands back the browser URLs; they must stay on the console origin. */
+function assertConsoleUrl(value: string, signal: AbortSignal): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Vibe sign-in returned an invalid URL");
   }
-  const document = (await response.json()) as Record<string, unknown>;
-  const authorizationEndpoint = asString(document.authorization_endpoint);
-  const tokenEndpoint = asString(document.token_endpoint);
-  if (!authorizationEndpoint || !tokenEndpoint) {
-    throw new Error("Mistral OIDC discovery is missing authorization/token endpoints");
+  if (url.origin !== VIBE_CONSOLE_ORIGIN) {
+    throw new Error(`Vibe sign-in returned a URL outside ${VIBE_CONSOLE_ORIGIN}`);
   }
-  return { authorizationEndpoint, tokenEndpoint };
+  signal.throwIfAborted();
+  return url.toString();
 }
 
-async function postTokenRequest(
-  tokenEndpoint: string,
-  body: Record<string, string>,
-  signal: AbortSignal,
-): Promise<TokenSet> {
-  const response = await fetch(tokenEndpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-    body: new URLSearchParams(body).toString(),
-    signal,
-  });
+function pkcePair(): { verifier: string; challenge: string } {
+  const base64Url = (buffer: Buffer): string =>
+    buffer.toString("base64").replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+  const verifier = base64Url(randomBytes(32));
+  const challenge = base64Url(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+async function readJson(response: Response, label: string): Promise<Record<string, unknown>> {
   const text = await response.text();
   let payload: Record<string, unknown> = {};
   try {
@@ -65,223 +67,151 @@ async function postTokenRequest(
     payload = {};
   }
   if (!response.ok) {
-    const detail = asString(payload.error_description) ?? asString(payload.error) ?? text.slice(0, 200);
-    throw new Error(`Mistral token request failed: HTTP ${response.status} ${detail}`.trim());
+    const detail = asString(payload.message) ?? asString(payload.error) ?? text.slice(0, 200);
+    throw new Error(`${label} failed: HTTP ${response.status}${detail ? ` ${detail}` : ""}`.trim());
   }
-  const access = asString(payload.access_token);
-  if (!access) throw new Error("Mistral token response did not include an access token");
-  const expiresIn = Number(payload.expires_in);
+  return payload;
+}
+
+async function startSignIn(signal: AbortSignal): Promise<SignInProcess & { verifier: string }> {
+  const { verifier, challenge } = pkcePair();
+  const response = await fetch(`${SIGN_IN_API_BASE}/vibe/sign-in`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ code_challenge: challenge, code_challenge_method: "S256" }),
+    signal,
+  });
+  const payload = await readJson(response, "Vibe sign-in start");
+  const processId = asString(payload.process_id);
+  const signInUrl = asString(payload.sign_in_url);
+  const pollUrl = asString(payload.poll_url);
+  if (!processId || !signInUrl || !pollUrl) {
+    throw new Error("Vibe sign-in start response is missing process_id/sign_in_url/poll_url");
+  }
+  const expiresAt = Date.parse(asString(payload.expires_at) ?? "");
   return {
-    access,
-    refresh: asString(payload.refresh_token),
-    idToken: asString(payload.id_token),
-    expiresIn: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 3600,
+    processId,
+    signInUrl: assertConsoleUrl(signInUrl, signal),
+    pollUrl: assertConsoleUrl(pollUrl, signal),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + 10 * 60 * 1_000,
+    verifier,
   };
 }
 
-/** Workspace/org discovery the Vibe API expects as `x-external-*` headers. */
-export async function discoverVibeTenant(
-  bearer: string,
-  signal: AbortSignal,
-): Promise<{ organizationId?: string; workspaceId?: string }> {
-  try {
-    const response = await fetch(
-      `${VIBE_OIDC_AUDIENCE}/v1/users/me/workspaces?limit=100&offset=0`,
-      { headers: { Authorization: `Bearer ${bearer}`, Accept: "application/json" }, signal },
-    );
-    if (!response.ok) return {};
-    const payload = (await response.json()) as { workspaces?: unknown };
-    const first = Array.isArray(payload.workspaces) ? payload.workspaces[0] : undefined;
-    if (!first || typeof first !== "object") return {};
-    const workspace = first as Record<string, unknown>;
-    return {
-      organizationId: asString(workspace.organization_id),
-      workspaceId: asString(workspace.id),
-    };
-  } catch {
-    return {};
+async function pollSignIn(pollUrl: string, signal: AbortSignal): Promise<PollResult> {
+  const response = await fetch(pollUrl, { headers: { Accept: "application/json" }, signal });
+  if (response.status === 410) return { status: "expired" };
+  const payload = await readJson(response, "Vibe sign-in poll");
+  const status = asString(payload.status);
+  if (status !== "pending" && status !== "completed" && status !== "expired" && status !== "denied" && status !== "error") {
+    throw new Error(`Vibe sign-in returned an unknown state: ${status ?? "missing"}`);
   }
+  return {
+    status,
+    exchangeToken: asString(payload.exchange_token),
+    message: asString(payload.message),
+  };
 }
 
-interface CallbackListener {
-  promise: Promise<{ code: string; state: string }>;
-  close: () => void;
-}
-
-function waitForCallback(redirect: URL, expectedState: string): CallbackListener {
-  let settle: (value: { code: string; state: string }) => void = () => {};
-  let fail: (error: Error) => void = () => {};
-  const promise = new Promise<{ code: string; state: string }>((resolve, reject) => {
-    settle = resolve;
-    fail = reject;
+async function exchangeForApiKey(
+  process: SignInProcess & { verifier: string },
+  exchangeToken: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const response = await fetch(`${SIGN_IN_API_BASE}/vibe/sign-in/${encodeURIComponent(process.processId)}/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ exchange_token: exchangeToken, code_verifier: process.verifier }),
+    signal,
   });
-  promise.catch(() => {});
-
-  const server = createCallbackServer((url, respond) => {
-    if (url.pathname !== redirect.pathname) {
-      respond(404, "<html><body><h3>Not found.</h3></body></html>");
-      return;
-    }
-    const error = url.searchParams.get("error");
-    const code = url.searchParams.get("code");
-    const state = url.searchParams.get("state") ?? "";
-    if (error) {
-      respond(200, "<html><body><h3>Mistral sign-in failed.</h3><p>You can close this window.</p></body></html>");
-      fail(new Error(`Mistral sign-in failed: ${error}`));
-      return;
-    }
-    respond(200, "<html><body><h3>Mistral Vibe sign-in complete.</h3><p>You can close this window and return to pi.</p></body></html>");
-    if (!code) {
-      fail(new Error("Mistral sign-in callback is missing an authorization code"));
-      return;
-    }
-    if (state !== expectedState) {
-      fail(new Error("Mistral sign-in state mismatch"));
-      return;
-    }
-    settle({ code, state });
-  });
-
-  server.on("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
-  server.listen(Number(redirect.port), redirect.hostname);
-  return { promise, close: () => server.close() };
+  const payload = await readJson(response, "Vibe sign-in exchange");
+  const apiKey = asString(payload.api_key);
+  if (!apiKey) throw new Error("Vibe sign-in exchange did not return an API key");
+  return apiKey;
 }
 
-function createCallbackServer(
-  handler: (url: URL, respond: (status: number, body: string) => void) => void,
-): Server {
-  return createServer((request, response) => {
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    handler(url, (status, body) => {
-      response.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
-      response.end(body);
-    });
+async function waitForSignIn(process: SignInProcess, signal: AbortSignal): Promise<string> {
+  let failures = 0;
+  while (Date.now() < process.expiresAt) {
+    signal.throwIfAborted();
+    let result: PollResult;
+    try {
+      result = await pollSignIn(process.pollUrl, signal);
+      failures = 0;
+    } catch (error) {
+      signal.throwIfAborted();
+      failures += 1;
+      if (failures >= MAX_CONSECUTIVE_POLL_FAILURES) throw error;
+      await sleep(pollDelay(process, failures), signal);
+      continue;
+    }
+    if (result.status === "completed") {
+      if (!result.exchangeToken) throw new Error("Vibe sign-in completed without an exchange token");
+      return result.exchangeToken;
+    }
+    if (result.status === "expired") throw new Error("Vibe sign-in expired; run /login vibe again");
+    if (result.status === "denied") throw new Error("Vibe sign-in was denied");
+    if (result.status === "error") throw new Error(result.message ?? "Vibe sign-in failed");
+    await sleep(pollDelay(process, 0), signal);
+  }
+  throw new Error("Vibe sign-in timed out; run /login vibe again");
+}
+
+function pollDelay(process: SignInProcess, failures: number): number {
+  const backoff = POLL_INTERVAL_MS * Math.min(2 ** Math.max(0, failures - 1), 5);
+  return Math.min(backoff, Math.max(0, process.expiresAt - Date.now()));
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new Error("Vibe sign-in cancelled"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
 export async function loginVibeAccount(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
-  const endpoints = await discoverEndpoints(interaction.signal);
-  const { verifier, challenge } = pkcePair();
-  const state = base64Url(randomBytes(24));
-  const nonce = base64Url(randomBytes(24));
-  const redirect = new URL(VIBE_OIDC_REDIRECT_URI);
-
-  const authUrl = new URL(endpoints.authorizationEndpoint);
-  authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("client_id", VIBE_OIDC_CLIENT_ID);
-  authUrl.searchParams.set("redirect_uri", VIBE_OIDC_REDIRECT_URI);
-  authUrl.searchParams.set("scope", VIBE_OIDC_SCOPE);
-  authUrl.searchParams.set("audience", VIBE_OIDC_AUDIENCE);
-  authUrl.searchParams.set("state", state);
-  authUrl.searchParams.set("nonce", nonce);
-  authUrl.searchParams.set("code_challenge", challenge);
-  authUrl.searchParams.set("code_challenge_method", "S256");
-
-  const listener = waitForCallback(redirect, state);
-  const timeout = setTimeout(() => {
-    listener.close();
-    interaction.signal.throwIfAborted();
-  }, LOGIN_TIMEOUT_MS);
-
-  try {
-    interaction.notify({
-      type: "auth_url",
-      url: authUrl.toString(),
-      instructions: `Complete Mistral Vibe sign-in in your browser. pi captures the callback on ${VIBE_OIDC_REDIRECT_URI}.`,
-    });
-
-    const { code } = await Promise.race([
-      listener.promise,
-      new Promise<never>((_resolve, reject) => {
-        if (interaction.signal.aborted) {
-          reject(new Error("Mistral sign-in cancelled"));
-          return;
-        }
-        interaction.signal.addEventListener("abort", () => reject(new Error("Mistral sign-in cancelled")), {
-          once: true,
-        });
-      }),
-    ]);
-
-    const tokens = await postTokenRequest(
-      endpoints.tokenEndpoint,
-      {
-        grant_type: "authorization_code",
-        client_id: VIBE_OIDC_CLIENT_ID,
-        code,
-        redirect_uri: VIBE_OIDC_REDIRECT_URI,
-        code_verifier: verifier,
-      },
-      interaction.signal,
-    );
-
-    const { organizationId, workspaceId } = await discoverVibeTenant(
-      tokens.idToken ?? tokens.access,
-      interaction.signal,
-    );
-
-    return {
-      type: "oauth",
-      access: tokens.access,
-      refresh: tokens.refresh ?? "",
-      expires: Date.now() + tokens.expiresIn * 1000,
-      idToken: tokens.idToken,
-      tokenEndpoint: endpoints.tokenEndpoint,
-      clientId: VIBE_OIDC_CLIENT_ID,
-      organizationId,
-      workspaceId,
-    };
-  } finally {
-    clearTimeout(timeout);
-    listener.close();
-  }
+  const process = await startSignIn(interaction.signal);
+  interaction.notify({
+    type: "auth_url",
+    url: process.signInUrl,
+    instructions:
+      "Sign in to Mistral in your browser and pick the workspace for Vibe. pi finishes on its own when the browser is done.",
+  });
+  const exchangeToken = await waitForSignIn(process, interaction.signal);
+  interaction.notify({ type: "progress", message: "Exchanging browser sign-in for a Vibe credential…" });
+  const apiKey = await exchangeForApiKey(process, exchangeToken, interaction.signal);
+  return {
+    type: "oauth",
+    access: apiKey,
+    refresh: apiKey,
+    expires: Date.now() + CREDENTIAL_TTL_MS,
+    apiKey,
+  };
 }
 
+/** The sign-in credential is a long-lived Vibe API key: renew the stored expiry, never network. */
 export async function refreshVibeAccount(
   credential: OAuthCredential,
   signal: AbortSignal,
 ): Promise<OAuthCredential> {
-  const tokenEndpoint = asString(credential.tokenEndpoint) ?? `${VIBE_OIDC_ISSUER}/oauth/token`;
-  const clientId = asString(credential.clientId) ?? VIBE_OIDC_CLIENT_ID;
-  const refreshToken = asString(credential.refresh);
-  if (!refreshToken) throw new Error("Mistral Vibe credential has no refresh token; run /login vibe again");
-
-  const tokens = await postTokenRequest(
-    tokenEndpoint,
-    { grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken },
-    signal,
-  );
-
-  const idToken = tokens.idToken ?? asString(credential.idToken);
-  let organizationId = asString(credential.organizationId);
-  let workspaceId = asString(credential.workspaceId);
-  if (!organizationId && idToken) {
-    const tenant = await discoverVibeTenant(idToken, signal);
-    organizationId = tenant.organizationId;
-    workspaceId = workspaceId ?? tenant.workspaceId;
-  }
-
-  return {
-    ...credential,
-    type: "oauth",
-    access: tokens.access,
-    refresh: tokens.refresh ?? refreshToken,
-    expires: Date.now() + tokens.expiresIn * 1000,
-    idToken,
-    tokenEndpoint,
-    clientId,
-    organizationId,
-    workspaceId,
-  };
+  signal.throwIfAborted();
+  const apiKey = asString(credential.apiKey) ?? asString(credential.access);
+  if (!apiKey) throw new Error("Mistral Vibe credential has no API key; run /login vibe again");
+  return { ...credential, type: "oauth", access: apiKey, refresh: apiKey, expires: Date.now() + CREDENTIAL_TTL_MS };
 }
 
-/** Vibe sends the id token plus `x-external-*` tenant headers (le-vibe `_resolve_oidc_credential`). */
 export function vibeOAuthToAuth(credential: OAuthCredential): ModelAuth {
-  const idToken = asString(credential.idToken);
-  return {
-    apiKey: idToken ?? credential.access,
-    ...(oidcTenantHeaders(credential) ?? {}),
-  };
+  const apiKey = asString(credential.apiKey) ?? asString(credential.access);
+  if (!apiKey) throw new Error("Mistral Vibe credential has no API key; run /login vibe again");
+  return { apiKey };
 }
 
 export const vibeOAuth: OAuthAuth = {
